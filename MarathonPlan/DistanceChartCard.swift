@@ -136,7 +136,9 @@ struct DistanceChartCard: View {
 }
 
 #Preview {
-    let store = TrackerStore()
+    let store = TrackerStore(repository: TrackerRepository(directory: FileManager.default.temporaryDirectory
+        .appendingPathComponent("MarathonPlan-Preview-\(UUID().uuidString)")),
+                             defaults: UserDefaults(suiteName: "MarathonPlan-Preview")!)
     let today = Plan.calendar.startOfDay(for: Date())
     let race = Plan.calendar.date(byAdding: .day, value: 17 * 7 + 6,
                                   to: TrainingPlan.monday(containing: today))!

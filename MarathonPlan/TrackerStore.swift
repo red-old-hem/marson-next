@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 @MainActor
 final class TrackerStore: ObservableObject {
@@ -8,60 +9,133 @@ final class TrackerStore: ObservableObject {
 
     /// ユーザーが明示的に取り消したヘルスケア由来の日。同期で復活させない
     @Published private(set) var suppressedAutoDays: Set<String> = [] {
-        didSet { UserDefaults.standard.set(Array(suppressedAutoDays), forKey: Self.suppressedKey) }
+        didSet { persist() }
     }
 
     /// 大会日から生成された実行中のプラン。大会未設定でもプレースホルダが入る(weeks を空にしないため)
     @Published private(set) var plan: TrainingPlan
     @Published private(set) var hasRaceSetting: Bool
+    @Published private(set) var notificationSettings: NotificationSettings = .init() {
+        didSet { persist() }
+    }
+    @Published private(set) var painChecks: [String: [BodyPart]] = [:] { didSet { persist() } }
+    @Published var storageMessage: String?
+    @Published private(set) var canUndoRestore = false
+    private let repository: TrackerRepository
+    private var raceSetting: RaceSetting?
+    private var updating = true
+    private var storageBlocked = false
 
     private static let storageKey = "mt-data"
+    private static let corruptBackupKey = "mt-data-corrupt-backup"
     private static let suppressedKey = "mt-hk-suppressed"
     private static let planKey = "mt-plan"
+    private static let notificationKey = "mt-notification-settings"
 
-    init() {
-        let setting = Self.loadSetting()
+    init(repository: TrackerRepository = TrackerRepository(), defaults: UserDefaults = .standard) {
+        self.repository = repository
+        let setting = defaults.data(forKey: Self.planKey).flatMap { try? JSONDecoder().decode(RaceSetting.self, from: $0) }
+        raceSetting = setting
         hasRaceSetting = setting != nil
         plan = TrainingPlan.make(setting ?? RaceSetting.placeholder())
-
-        suppressedAutoDays = Set(UserDefaults.standard.stringArray(forKey: Self.suppressedKey) ?? [])
-        if let data = UserDefaults.standard.data(forKey: Self.storageKey),
-           let decoded = try? JSONDecoder().decode([String: RunLog].self, from: data) {
-            let migrated = Self.migrateLegacyAutoLogs(decoded)
-            logs = migrated
-            // init 内の代入では didSet が呼ばれないので明示的に保存する
-            if migrated != decoded { persist() }
+        do {
+            if let state = try repository.load() {
+                apply(state)
+                updating = false
+                canUndoRestore = repository.canUndoRestore
+                return
+            }
+        } catch {
+            storageBlocked = true
+            storageMessage = "保存データを読み込めませんでした。原本は保持しています。バックアップから復元してください。"
+            updating = false
+            return
         }
+        suppressedAutoDays = Set(defaults.stringArray(forKey: Self.suppressedKey) ?? [])
+        if let data = defaults.data(forKey: Self.notificationKey),
+           let saved = try? JSONDecoder().decode(NotificationSettings.self, from: data) {
+            notificationSettings = saved
+        }
+        if let data = defaults.data(forKey: Self.storageKey) {
+            if let decoded = Self.decodeLogs(data) {
+                logs = Self.migrateLegacyAutoLogs(decoded.logs)
+                if decoded.wasPartiallyRecovered {
+                    defaults.set(data, forKey: Self.corruptBackupKey)
+                    storageMessage = "一部の記録を復旧しました。元の保存データも保持しています。"
+                }
+            } else {
+                defaults.set(data, forKey: Self.corruptBackupKey)
+                storageBlocked = true
+                storageMessage = "記録を読み込めませんでした。元データを退避しました。バックアップから復元してください。"
+            }
+        }
+        painChecks = logs.compactMapValues(\.pains)
+        updating = false
+        persist()
+    }
+
+    func setNotificationSettings(_ settings: NotificationSettings) {
+        notificationSettings = settings
+    }
+
+    func exportBackupData() throws -> Data {
+        try BackupCodec.validate(snapshot)
+        return try JSONEncoder().encode(snapshot)
+    }
+
+    /// バックアップは現在の記録・大会設定・通知設定を丸ごと置き換える。
+    func restoreBackupData(_ data: Data) throws {
+        let backup = try BackupCodec.decode(data)
+        // 保存が成功するまで画面上の状態も変更しない。
+        try repository.save(backup, preservingCurrent: true)
+        updating = true
+        apply(backup)
+        updating = false
+        storageBlocked = false
+        canUndoRestore = repository.canUndoRestore
+    }
+
+    func undoRestore() throws { try restoreBackupData(repository.previousData()) }
+
+    private var snapshot: TrackerBackup {
+        TrackerBackup(version: 2, raceSetting: raceSetting, logs: logs,
+                      suppressedAutoDays: suppressedAutoDays, notificationSettings: notificationSettings,
+                      painChecks: painChecks)
+    }
+
+    private func apply(_ state: TrackerBackup) {
+        logs = Self.migrateLegacyAutoLogs(state.logs)
+        suppressedAutoDays = state.suppressedAutoDays
+        notificationSettings = state.notificationSettings
+        painChecks = state.painChecks ?? logs.compactMapValues(\.pains)
+        raceSetting = state.raceSetting
+        hasRaceSetting = raceSetting != nil
+        plan = TrainingPlan.make(raceSetting ?? RaceSetting.placeholder())
     }
 
     // MARK: - 大会設定
-
-    private static func loadSetting() -> RaceSetting? {
-        guard let data = UserDefaults.standard.data(forKey: planKey) else { return nil }
-        return try? JSONDecoder().decode(RaceSetting.self, from: data)
-    }
 
     /// 大会日を設定・変更する。ログには一切触れない。
     func setRace(name: String, date: Date) {
         let today = Plan.calendar.startOfDay(for: Date())
         let race = Plan.calendar.startOfDay(for: date)
-        let start = TrainingPlan.resolveStart(race: race,
+        let start = hasRaceSetting && race == plan.race ? plan.start : TrainingPlan.resolveStart(race: race,
                                               existingStart: hasRaceSetting ? plan.start : nil,
                                               today: today)
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let setting = RaceSetting(raceName: trimmed.isEmpty ? "フルマラソン" : trimmed,
                                   raceDateKey: Plan.key(for: race),
                                   startDateKey: Plan.key(for: start))
-        if let data = try? JSONEncoder().encode(setting) {
-            UserDefaults.standard.set(data, forKey: Self.planKey)
-        }
+        raceSetting = setting
         plan = TrainingPlan.make(setting)
         hasRaceSetting = true
+        persist()
     }
 
     /// 週の割り当てが変わるか(確認ダイアログの出し分け用)
     func planWouldShift(date: Date) -> Bool {
         guard hasRaceSetting, !logs.isEmpty else { return false }
+        if Plan.calendar.isDate(date, inSameDayAs: plan.race) { return false }
         let today = Plan.calendar.startOfDay(for: Date())
         let race = Plan.calendar.startOfDay(for: date)
         let newStart = TrainingPlan.resolveStart(race: race, existingStart: plan.start, today: today)
@@ -80,10 +154,34 @@ final class TrackerStore: ObservableObject {
         return out
     }
 
-    private func persist() {
-        if let data = try? JSONEncoder().encode(logs) {
-            UserDefaults.standard.set(data, forKey: Self.storageKey)
+    /// 旧形式は辞書全体を一括でデコードしていたため、1件の壊れたログで全履歴を失っていた。
+    /// まず通常デコードを試し、失敗時だけ JSON の各値を個別に復旧する。
+    private static func decodeLogs(_ data: Data) -> (logs: [String: RunLog], wasPartiallyRecovered: Bool)? {
+        if let logs = try? JSONDecoder().decode([String: RunLog].self, from: data) {
+            return (logs, false)
         }
+        guard let object = try? JSONSerialization.jsonObject(with: data),
+              let rawLogs = object as? [String: Any] else { return nil }
+
+        var recovered: [String: RunLog] = [:]
+        var discarded = 0
+        for (key, value) in rawLogs {
+            guard JSONSerialization.isValidJSONObject(value),
+                  let entryData = try? JSONSerialization.data(withJSONObject: value),
+                  let log = try? JSONDecoder().decode(RunLog.self, from: entryData) else {
+                discarded += 1
+                continue
+            }
+            recovered[key] = log
+        }
+        guard !recovered.isEmpty else { return nil }
+        return (recovered, true)
+    }
+
+    private func persist() {
+        guard !updating, !storageBlocked else { return }
+        do { try repository.save(snapshot) }
+        catch { storageMessage = "データを保存できませんでした: \(error.localizedDescription)" }
     }
 
     func key(for date: Date) -> String { Plan.key(for: date) }
@@ -91,8 +189,13 @@ final class TrackerStore: ObservableObject {
     func log(on date: Date) -> RunLog? { logs[key(for: date)] }
 
     func record(_ log: RunLog, on date: Date) {
+        guard BackupCodec.validDistance(log.km), BackupCodec.validDistance(log.autoKm) else { return }
+        updating = true
         suppressedAutoDays.remove(key(for: date))
         logs[key(for: date)] = log
+        if let pains = log.pains { painChecks[key(for: date)] = pains }
+        updating = false
+        persist()
     }
 
     func remove(on date: Date) {
@@ -112,6 +215,8 @@ final class TrackerStore: ObservableObject {
         var changed = false
 
         for summary in summaries.sorted(by: { $0.date < $1.date }) {
+            guard BackupCodec.validDistance(summary.km),
+                  summary.seconds.map({ (0...604_800).contains($0) }) ?? true else { continue }
             let k = key(for: summary.date)
             if suppressedAutoDays.contains(k) { continue }
             let ids = summary.workoutIDs.sorted()
@@ -132,7 +237,6 @@ final class TrackerStore: ObservableObject {
             } else {
                 next[k] = RunLog(
                     type: .run,
-                    menu: nextMenu(on: summary.date, in: next),
                     auto: true,
                     autoKm: summary.km,
                     autoSeconds: summary.seconds,
@@ -153,14 +257,9 @@ final class TrackerStore: ObservableObject {
 
     func weekDates(_ week: Int) -> [Date] { plan.weekDates(week) }
 
-    // 以下3組は applyWorkouts が作業中の辞書を渡せるようスナップショット版を持つ。
-    // 同一バッチで複数日を新規作成するとき、logs はまだ更新されていないため
-    // 作業中の辞書を見ないと全日に同じメニューが割り当たってしまう。
-    private func weekLogs(_ week: Int, in source: [String: RunLog]) -> [RunLog] {
-        weekDates(week).compactMap { source[key(for: $0)] }
+    func weekLogs(_ week: Int) -> [RunLog] {
+        weekDates(week).compactMap { logs[key(for: $0)] }
     }
-
-    func weekLogs(_ week: Int) -> [RunLog] { weekLogs(week, in: logs) }
 
     func weekAchieved(_ week: Int) -> Bool { weekLogs(week).count >= 2 }
 
@@ -168,31 +267,16 @@ final class TrackerStore: ObservableObject {
         weekLogs(week).compactMap(\.distanceKm).reduce(0, +)
     }
 
-    /// 同名メニューが週に複数ある場合に対応した消化数
-    private func menuDoneCounts(week: Int, in source: [String: RunLog]) -> [String: Int] {
-        var counts: [String: Int] = [:]
-        for log in weekLogs(week, in: source) where log.type == .run {
-            if let menu = log.menu { counts[menu, default: 0] += 1 }
-        }
-        return counts
-    }
-
-    func menuDoneCounts(week: Int) -> [String: Int] { menuDoneCounts(week: week, in: logs) }
-
-    /// 直近のラン記録から連続する痛みを検出(休養記録は数えず、途切れさせもしない)。
-    /// 最新のランが痛みなしなら警告なし。
+    /// 回答済みの体調だけを判定する。未回答は警告を解除しない。
     func painWarning() -> PainWarning? {
-        let recentRuns = logs.sorted { $0.key > $1.key }
-            .map(\.value)
-            .filter { $0.type == .run || $0.type == .mini }
-        guard let latest = recentRuns.first,
-              let latestPains = latest.pains, !latestPains.isEmpty else { return nil }
+        let recentChecks = painChecks.sorted { $0.key > $1.key }.map(\.value)
+        guard let latestPains = recentChecks.first, !latestPains.isEmpty else { return nil }
 
         var worst: PainWarning?
         for part in latestPains {
             var count = 0
-            for log in recentRuns {
-                if (log.pains ?? []).contains(part) { count += 1 } else { break }
+            for pains in recentChecks {
+                if pains.contains(part) { count += 1 } else { break }
             }
             if count >= 2 && count > (worst?.count ?? 0) {
                 worst = PainWarning(part: part, count: count)
@@ -201,50 +285,47 @@ final class TrackerStore: ObservableObject {
         return worst
     }
 
-    /// 既存の記録に痛み情報を後から追記・編集する
+    /// 運動記録がなくても体調を保存できる。空配列は明示的な「痛みなし」。
     func updatePains(_ pains: [BodyPart], on date: Date) {
-        guard var log = logs[key(for: date)] else { return }
-        log.pains = pains.isEmpty ? nil : pains
+        updating = true
+        painChecks[key(for: date)] = pains
+        if var log = logs[key(for: date)] {
+            log.pains = pains
+            logs[key(for: date)] = log
+        }
+        updating = false
+        persist()
+    }
+
+    /// ユーザーが予定IDに対応付けた実績だけを完了とする。
+    func menuProgress(week: Int) -> [Bool] {
+        sessions(week: week).map { isSessionCompleted($0.id) }
+    }
+
+    var scheduledSessions: [ScheduledSession] {
+        TrainingSchedule.sessions(plan: plan, weekdays: notificationSettings.runWeekdays)
+    }
+
+    func sessions(week: Int) -> [ScheduledSession] {
+        scheduledSessions.filter { plan.weekIndex(of: $0.date) == week }
+    }
+
+    func isSessionCompleted(_ id: String) -> Bool {
+        logs.values.contains { $0.type == .run && $0.sessionID == id }
+    }
+
+    func confirmSession(_ id: String?, on date: Date) {
+        guard var log = log(on: date), log.type == .run else { return }
+        if let id {
+            guard let session = scheduledSessions.first(where: { $0.id == id }),
+                  !session.isRace || Plan.calendar.isDate(date, inSameDayAs: plan.race),
+                  plan.weekIndex(of: date) == plan.weekIndex(of: session.date),
+                  !logs.contains(where: { $0.key != key(for: date) && $0.value.sessionID == id }) else { return }
+            log.menu = session.title
+        } else { log.menu = nil }
+        log.sessionID = id
         logs[key(for: date)] = log
     }
-
-    /// その日が属する週の未消化メニューのうち先頭のもの。
-    /// プラン範囲外の日は nil(HealthKit がプラン開始前の記録を作ったとき
-    /// W1 のメニュー名が付いてしまうのを防ぐ)
-    private func nextMenu(on date: Date, in source: [String: RunLog]) -> String? {
-        let week = weekIndex(of: date)
-        guard plan.contains(week: week) else { return nil }
-        let counts = menuDoneCounts(week: week, in: source)
-        var seen: [String: Int] = [:]
-        for run in plan.week(week).runs {
-            seen[run, default: 0] += 1
-            if counts[run, default: 0] < seen[run]! { return run }
-        }
-        return nil
-    }
-
-    /// 週のメニュー消化状況。完全一致を優先し、どのメニューにも一致しなかった
-    /// ラン記録(自由ランや、大会日変更で古くなったメニュー名)は
-    /// 上から順に未消化スロットへ充当する。
-    func menuProgress(week: Int) -> [Bool] {
-        let runs = plan.week(week).runs
-        let counts = menuDoneCounts(week: week)
-        var seen: [String: Int] = [:]
-        var flags = runs.map { run -> Bool in
-            seen[run, default: 0] += 1
-            return counts[run, default: 0] >= seen[run]!
-        }
-        let matched = flags.filter { $0 }.count
-        let loggedRuns = weekLogs(week).filter { $0.type == .run }.count
-        var spare = max(0, loggedRuns - matched)
-        for i in flags.indices where !flags[i] && spare > 0 {
-            flags[i] = true
-            spare -= 1
-        }
-        return flags
-    }
-
-    func nextMenu(on date: Date) -> String? { nextMenu(on: date, in: logs) }
 
     func streak(today: Date) -> Int {
         let cur = weekIndex(of: today)

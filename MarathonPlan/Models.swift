@@ -36,6 +36,26 @@ enum Feel: String, Codable, CaseIterable {
     }
 }
 
+/// ローカル通知の設定。曜日は Calendar.weekday (日=1 ... 土=7)。
+struct NotificationSettings: Codable, Equatable {
+    var enabled = true
+    var runWeekdays: Set<Int> = [3, 5, 7]
+    var morningHour = 7
+    var eveningEnabled = true
+    var eveningHour = 20
+}
+
+/// 機種変更・復元用のアプリデータ。将来の形式変更は version で判定する。
+struct TrackerBackup: Codable {
+    let version: Int
+    let raceSetting: RaceSetting?
+    let logs: [String: RunLog]
+    let suppressedAutoDays: Set<String>
+    let notificationSettings: NotificationSettings
+    /// キーなし=未回答、空配列=痛みなし。運動記録の有無と独立させる。
+    var painChecks: [String: [BodyPart]]? = nil
+}
+
 struct RunLog: Codable, Equatable {
     var type: LogType
     var menu: String? = nil
@@ -47,8 +67,8 @@ struct RunLog: Codable, Equatable {
     var feel: Feel? = nil
 
     // 以下は必ず Optional にし、必ず末尾に追加すること。
-    // 合成 Codable は非Optional に decode を生成するためデフォルト値があっても
-    // 旧JSONで throw し、TrackerStore.init の try? が全ログを nil にして保存データが消える。
+    // 合成 Codable は非Optional に decode を生成するため、デフォルト値があっても
+    // 旧JSONで throw する。旧バックアップ・保存データとの互換性を守る。
 
     /// その日のヘルスケアのラン距離の合計 (km, 0.1刻み)
     var autoKm: Double? = nil
@@ -56,6 +76,8 @@ struct RunLog: Codable, Equatable {
     var autoSeconds: Int? = nil
     /// 取り込み済みワークアウトのUUID(昇順)。変更検知に使う
     var workoutIDs: [String]? = nil
+    /// ユーザーが明示的に完了を確認した予定。自動同期では設定しない。
+    var sessionID: String? = nil
 }
 
 extension RunLog {
@@ -78,6 +100,7 @@ extension RunLog {
 enum Format {
     /// 384.3 → "6:24/km"
     static func pace(_ secPerKm: Double) -> String {
+        guard secPerKm.isFinite, (0...1_000_000).contains(secPerKm) else { return "—" }
         let total = Int(secPerKm.rounded())
         return String(format: "%d:%02d/km", total / 60, total % 60)
     }
@@ -91,6 +114,7 @@ enum Format {
 
     /// 6.0 → "6" / 6.5 → "6.5"
     static func km(_ value: Double) -> String {
+        guard value.isFinite, (0...100_000_000).contains(value) else { return "—" }
         let rounded = (value * 10).rounded() / 10
         return rounded == rounded.rounded()
             ? String(Int(rounded))

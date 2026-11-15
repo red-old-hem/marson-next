@@ -2,7 +2,7 @@ import Foundation
 import HealthKit
 
 /// ヘルスケアのランニングワークアウトを読み取り、未チェックの日を自動でチェックインする。
-/// 手動記録がある日はスキップし、上書きしない。
+/// 手動の種別・予定の完了・体調は変更せず、実測値のみ取り込む。
 @MainActor
 final class HealthKitManager: ObservableObject {
     static let shared = HealthKitManager()
@@ -11,6 +11,7 @@ final class HealthKitManager: ObservableObject {
     private static let enabledKey = "hk-enabled"
 
     @Published var isEnabled = UserDefaults.standard.bool(forKey: enabledKey)
+    @Published private(set) var lastSyncErrorMessage: String?
 
     var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
@@ -20,6 +21,7 @@ final class HealthKitManager: ObservableObject {
             try await healthStore.requestAuthorization(toShare: [], read: [HKObjectType.workoutType()])
             UserDefaults.standard.set(true, forKey: Self.enabledKey)
             isEnabled = true
+            lastSyncErrorMessage = nil
             return true
         } catch {
             return false
@@ -44,7 +46,9 @@ final class HealthKitManager: ObservableObject {
         let workouts: [HKWorkout]
         do {
             workouts = try await fetchWorkouts(predicate: predicate)
+            lastSyncErrorMessage = nil
         } catch {
+            lastSyncErrorMessage = "ワークアウトを読み込めませんでした。ヘルスケアのアクセス許可を確認してください。"
             return
         }
 

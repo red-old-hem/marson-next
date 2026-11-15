@@ -7,14 +7,13 @@ struct MarathonPlanApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            TimelineView(.periodic(from: .now, by: 60)) { _ in ContentView() }
                 .environmentObject(store)
                 // 大会日が設定されるまで閉じられない。設定された瞬間に自動で閉じる
                 .fullScreenCover(isPresented: .constant(!store.hasRaceSetting)) {
                     RaceSettingSheet(isOnboarding: true).environmentObject(store)
                 }
                 .onAppear {
-                    NotificationManager.requestAuthorization()
                     NotificationManager.reschedule(store: store)
                 }
                 .onChange(of: scenePhase) { _, phase in

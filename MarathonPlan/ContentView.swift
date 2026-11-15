@@ -9,18 +9,41 @@ struct ContentView: View {
     private var inPlan: Bool { store.plan.contains(week: currentWeek) }
 
     var body: some View {
+        TabView {
+            todayScreen.tabItem { Label("今日", systemImage: "sun.max") }
+            ScrollView {
+                VStack(spacing: 14) {
+                    if inPlan { MenuCard(menuWeek: menuWeek) }
+                    else { Text(currentWeek < 0 ? "プラン開始前です" : "プランは終了しました") }
+                    CalendarCard()
+                }.padding()
+            }.tabItem { Label("プラン", systemImage: "calendar") }
+            ScrollView {
+                VStack(spacing: 14) {
+                    StatsCard()
+                    DistanceChartCard()
+                    HistoryList()
+                }.padding()
+            }.tabItem { Label("履歴", systemImage: "chart.bar") }
+            SettingsHome().tabItem { Label("設定", systemImage: "gearshape") }
+        }
+        .tint(.green)
+        .alert("保存データのお知らせ", isPresented: Binding(get: { store.storageMessage != nil }, set: { if !$0 { store.storageMessage = nil } })) {
+            Button("OK") { store.storageMessage = nil }
+        } message: { Text(store.storageMessage ?? "") }
+    }
+
+    private var todayScreen: some View {
         ScrollView {
             VStack(spacing: 14) {
                 HeaderView(currentWeek: currentWeek, inPlan: inPlan)
                 PainBanner()
+                TodayScheduleCard()
                 TodayCard(menuWeek: menuWeek)
+                DailyPainCard()
                 GaugeCard(currentWeek: currentWeek, menuWeek: menuWeek, inPlan: inPlan)
-                MenuCard(menuWeek: menuWeek)
                 MealCard()
                 HealthCard()
-                StatsCard()
-                DistanceChartCard()
-                CalendarCard()
                 Text(goalText)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -80,6 +103,7 @@ struct HeaderView: View {
                 }
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 32, minHeight: 44)
+                .accessibilityLabel("設定を開く")
             }
             HStack(alignment: .firstTextBaseline) {
                 if daysToRace > 0 {
@@ -91,7 +115,7 @@ struct HeaderView: View {
                     Text("本番当日!")
                         .font(.system(size: 34, weight: .bold))
                 } else {
-                    Text("完走おめでとう 🎉")
+                    Text("大会おつかれさまでした")
                         .font(.system(size: 28, weight: .bold))
                 }
                 Spacer()
@@ -110,7 +134,7 @@ struct HeaderView: View {
         }
         .padding(.top, 8)
         .sheet(isPresented: $showingSetting) {
-            RaceSettingSheet(isOnboarding: false).environmentObject(store)
+            SettingsHome().environmentObject(store)
         }
     }
 }
@@ -256,8 +280,9 @@ struct TodayCard: View {
             } else if showingForm {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("どのメニュー?").font(.caption).foregroundStyle(.secondary)
-                    Picker("メニュー", selection: $selectedMenu) {
-                        ForEach(menuOptions, id: \.self) { Text($0).tag($0) }
+                    Picker("実施したメニュー", selection: $selectedMenu) {
+                        Text("自由ラン・あとで確認").tag("")
+                        ForEach(availableSessions) { session in Text(session.title).tag(session.id) }
                     }
                     .pickerStyle(.menu)
                     Text("距離 (km・わかれば)").font(.caption).foregroundStyle(.secondary)
@@ -295,9 +320,15 @@ struct TodayCard: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(.green)
+                        .disabled(!isDistanceValid)
                         Button("やめる") { showingForm = false }
                             .foregroundStyle(.secondary)
                             .frame(minHeight: 44)
+                    }
+                    if !isDistanceValid {
+                        Text("距離は0〜100kmの数値で入力してください")
+                            .font(.caption)
+                            .foregroundStyle(.red)
                     }
                 }
             } else {
@@ -348,14 +379,14 @@ struct TodayCard: View {
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
     }
 
-    private var menuOptions: [String] {
-        var options = store.plan.week(menuWeek).runs
-        options.append("メニュー外の自由ラン")
-        return options
+    private var availableSessions: [ScheduledSession] {
+        store.sessions(week: store.weekIndex(of: today)).filter {
+            !store.isSessionCompleted($0.id) && (!$0.isRace || Plan.calendar.isDate($0.date, inSameDayAs: today))
+        }
     }
 
     private func prepareForm() {
-        selectedMenu = store.nextMenu(on: today) ?? "メニュー外の自由ラン"
+        selectedMenu = ""
         kmText = ""
         selectedPains = []
         feel = nil
@@ -363,14 +394,28 @@ struct TodayCard: View {
     }
 
     private func save() {
-        let km = Double(kmText.replacingOccurrences(of: ",", with: "."))
+        guard isDistanceValid else { return }
         store.record(
-            RunLog(type: .run, menu: selectedMenu, km: km,
+            RunLog(type: .run, km: parsedKm,
                    pains: selectedPains.isEmpty ? nil : Array(selectedPains), feel: feel),
             on: today
         )
+        if !selectedMenu.isEmpty { store.confirmSession(selectedMenu, on: today) }
         NotificationManager.reschedule(store: store)
         showingForm = false
+    }
+
+    private var parsedKm: Double? {
+        let input = kmText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return nil }
+        return Double(input.replacingOccurrences(of: ",", with: "."))
+    }
+
+    private var isDistanceValid: Bool {
+        guard let km = parsedKm else {
+            return kmText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return km.isFinite && (0...100).contains(km)
     }
 
     private func statusText(_ log: RunLog) -> String {
@@ -444,16 +489,15 @@ struct MenuCard: View {
 
     var body: some View {
         let weekPlan = store.plan.week(menuWeek)
-        let done = store.menuProgress(week: menuWeek)
 
         VStack(alignment: .leading, spacing: 10) {
             Text("今週のメニュー").font(.subheadline.bold())
-            ForEach(Array(weekPlan.runs.enumerated()), id: \.offset) { i, run in
-                let isDone = i < done.count && done[i]
+            ForEach(store.sessions(week: menuWeek)) { session in
+                let isDone = store.isSessionCompleted(session.id)
                 HStack(spacing: 10) {
                     Image(systemName: isDone ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isDone ? .green : Color(.systemGray4))
-                    Text(run)
+                    Text("\(session.date.formatted(.dateTime.month().day())) \(session.title)")
                         .strikethrough(isDone)
                         .foregroundStyle(isDone ? .secondary : .primary)
                     Spacer()
@@ -520,33 +564,40 @@ struct HealthCard: View {
 
     var body: some View {
         if health.isAvailable {
-            HStack(spacing: 12) {
-                Image(systemName: health.isEnabled ? "heart.fill" : "heart")
-                    .font(.title3)
-                    .foregroundStyle(.pink)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(health.isEnabled ? "ヘルスケア連携中" : "ヘルスケア連携")
-                        .font(.subheadline.bold())
-                    Text(health.isEnabled
-                         ? "ワークアウトのランを自動でチェックイン"
-                         : "Apple Watch等で走った日を自動記録")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if !health.isEnabled {
-                    Button("連携する") {
-                        requesting = true
-                        Task {
-                            if await health.enable() {
-                                await health.syncWorkouts(into: store)
-                            }
-                            requesting = false
-                        }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Image(systemName: health.isEnabled ? "heart.fill" : "heart")
+                        .font(.title3)
+                        .foregroundStyle(.pink)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(health.isEnabled ? "ヘルスケア連携中" : "ヘルスケア連携")
+                            .font(.subheadline.bold())
+                        Text(health.isEnabled
+                             ? "ワークアウトのランを自動でチェックイン"
+                             : "Apple Watch等で走った日を自動記録")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.pink)
-                    .disabled(requesting)
+                    Spacer()
+                    if !health.isEnabled {
+                        Button("連携する") {
+                            requesting = true
+                            Task {
+                                if await health.enable() {
+                                    await health.syncWorkouts(into: store)
+                                }
+                                requesting = false
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.pink)
+                        .disabled(requesting)
+                    }
+                }
+                if let error = health.lastSyncErrorMessage {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
             .padding(16)
@@ -666,5 +717,7 @@ struct CalendarCard: View {
 }
 
 #Preview {
-    ContentView().environmentObject(TrackerStore())
+    ContentView().environmentObject(TrackerStore(repository: TrackerRepository(directory: FileManager.default.temporaryDirectory
+        .appendingPathComponent("MarathonPlan-Preview-\(UUID().uuidString)")),
+                                                defaults: UserDefaults(suiteName: "MarathonPlan-Preview")!))
 }
